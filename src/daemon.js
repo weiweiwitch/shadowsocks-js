@@ -13,7 +13,7 @@ import { createLogger, LOG_NAMES } from './logger';
 import { getConfig } from './cli';
 import { deletePidFile } from './pid';
 import { record, stopRecord } from './recordMemoryUsage';
-import { createSafeAfterHandler } from './utils';
+import { createSafeAfterHandler, safelyKillChild } from './utils';
 
 const NAME = 'daemon';
 // TODO:
@@ -22,6 +22,7 @@ const MAX_RESTART_TIME = 1;
 
 let child = null;
 let logger;
+let shouldStop = false;
 
 export const FORK_FILE_PATH = {
   local: join(__dirname, 'ssLocal'),
@@ -44,9 +45,13 @@ function daemon(type, config, filePath, shouldRecordServerMemory, _restartTime) 
   }, 60 * 1000);
 
   child.on('exit', () => {
+    if (shouldStop) {
+      return;
+    }
+
     logger.warn(`${NAME}: process exit.`);
 
-    child.kill('SIGKILL');
+    safelyKillChild(child, 'SIGKILL');
 
     if (restartTime < MAX_RESTART_TIME) {
       daemon(type, config, filePath, shouldRecordServerMemory, restartTime + 1);
@@ -65,30 +70,39 @@ function daemon(type, config, filePath, shouldRecordServerMemory, _restartTime) 
 if (module === require.main) {
   const type = process.argv[2];
   const argv = process.argv.slice(3);
-  const { proxyOptions } = getConfig(argv);
-  const shouldRecordServerMemory = proxyOptions._recordMemoryUsage && type === 'server';
 
-  logger = createLogger(proxyOptions.level, LOG_NAMES.DAEMON, false);
+  getConfig(argv, (err, config) => {
+    const { proxyOptions } = config;
+    const shouldRecordServerMemory = proxyOptions._recordMemoryUsage && type === 'server';
 
-  daemon(type, proxyOptions, FORK_FILE_PATH[type], shouldRecordServerMemory);
+    logger = createLogger(proxyOptions.level, LOG_NAMES.DAEMON, false);
 
-  process.on('SIGHUP', () => {
-    if (child) {
-      child.kill('SIGKILL');
+    if (err) {
+      logger.error(`${NAME}: ${err.message}`);
     }
 
-    deletePidFile(type);
+    daemon(type, proxyOptions, FORK_FILE_PATH[type], shouldRecordServerMemory);
 
-    if (shouldRecordServerMemory) {
-      stopRecord();
-    }
+    process.on('SIGHUP', () => {
+      shouldStop = true;
 
-    process.exit(0);
-  });
+      if (child) {
+        safelyKillChild(child, 'SIGKILL');
+      }
 
-  process.on('uncaughtException', err => {
-    logger.error(`${NAME} get error:\n${err.stack}`, createSafeAfterHandler(logger, () => {
-      process.exit(1);
-    }));
+      deletePidFile(type);
+
+      if (shouldRecordServerMemory) {
+        stopRecord();
+      }
+
+      process.exit(0);
+    });
+
+    process.on('uncaughtException', err => {
+      logger.error(`${NAME} get error:\n${err.stack}`, createSafeAfterHandler(logger, () => {
+        process.exit(1);
+      }));
+    });
   });
 }

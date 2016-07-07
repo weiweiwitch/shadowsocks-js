@@ -2,6 +2,8 @@ import path from 'path';
 import minimist from 'minimist';
 import { spawn } from 'child_process';
 import { readFileSync, accessSync } from 'fs';
+import { isV4Format } from 'ip';
+import { lookup } from 'dns';
 
 import DEFAULT_CONFIG from './defaultConfig';
 import { version } from '../package.json';
@@ -10,6 +12,7 @@ import * as ssLocal from './ssLocal';
 import * as ssServer from './ssServer';
 import { getPid, writePidFile, deletePidFile } from './pid';
 import { updateGFWList as _updateGFWList, GFWLIST_FILE_PATH } from './gfwlistUtils';
+import { safelyKill } from './utils';
 
 const PROXY_ARGUMENT_PAIR = {
   c: 'configFilePath',
@@ -52,9 +55,11 @@ function getDaemonType(isServer) {
 
 function isRunning(pid) {
   try {
+    // signal 0 to test existence
     return process.kill(pid, 0);
   } catch (e) {
-    return e.code === 'EPERM';
+    // NOTE: 'EPERM' permissions, 'ESRCH' process group doesn't exist
+    return e.code !== 'ESRCH';
   }
 }
 
@@ -123,14 +128,34 @@ function readConfig(_filePath) {
   return JSON.parse(readFileSync(filePath));
 }
 
-export function getConfig(argv = []) {
+// export for test
+export function resolveServerAddr(config, next) {
+  const { serverAddr } = config.proxyOptions;
+
+  if (isV4Format(serverAddr)) {
+    next(null, config);
+  } else {
+    lookup(serverAddr, (err, addresses) => {
+      if (err) {
+        next(new Error(`failed to resolve 'serverAddr': ${serverAddr}`), config);
+      } else {
+        // NOTE: mutate data
+        config.proxyOptions.serverAddr = addresses; // eslint-disable-line
+        next(null, config);
+      }
+    });
+  }
+}
+
+export function getConfig(argv = [], next) {
   const { generalOptions, proxyOptions, invalidOption } = getArgvOptions(argv);
   const specificFileConfig = readConfig(proxyOptions.configFilePath) || fileConfig;
-
-  return {
+  const config = {
     generalOptions, invalidOption,
     proxyOptions: Object.assign({}, DEFAULT_CONFIG, specificFileConfig, proxyOptions),
   };
+
+  resolveServerAddr(config, next);
 }
 
 function logHelp(invalidOption) {
@@ -196,8 +221,8 @@ function startDaemon(isServer) {
 
 function stopDaemon(isServer, pid) {
   if (pid) {
-    process.kill(pid, 'SIGHUP');
     deletePidFile(getDaemonType(isServer));
+    safelyKill(pid, 'SIGHUP');
     log('stop');
   } else {
     log('already stopped');
@@ -242,15 +267,22 @@ function runSingle(isServer, proxyOptions) {
 
 export default function client(isServer) {
   const argv = process.argv.slice(2);
-  const { generalOptions, proxyOptions, invalidOption } = getConfig(argv);
 
-  if (generalOptions.help || invalidOption) {
-    logHelp(invalidOption);
-  } else if (generalOptions.pacUpdateGFWList) {
-    updateGFWList(generalOptions.pacUpdateGFWList);
-  } else if (generalOptions.daemon) {
-    runDaemon(isServer, generalOptions.daemon);
-  } else {
-    runSingle(isServer, proxyOptions);
-  }
+  getConfig(argv, (err, config) => {
+    if (err) {
+      throw err;
+    }
+
+    const { generalOptions, proxyOptions, invalidOption } = config;
+
+    if (generalOptions.help || invalidOption) {
+      logHelp(invalidOption);
+    } else if (generalOptions.pacUpdateGFWList) {
+      updateGFWList(generalOptions.pacUpdateGFWList);
+    } else if (generalOptions.daemon) {
+      runDaemon(isServer, generalOptions.daemon);
+    } else {
+      runSingle(isServer, proxyOptions);
+    }
+  });
 }
